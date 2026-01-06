@@ -1,7 +1,74 @@
 #include "Particles.h"
 #include "Alloc.h"
+#include "PrecisionTypes.h"
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+
+//** CUDA error checking helper*/
+static inline void cudaCheck(cudaError_t err, const char* what)
+{
+    if (err != cudaSuccess) {
+        std::fprintf(stderr, "CUDA error (%s): %s\n", what, cudaGetErrorString(err));
+        std::abort();
+    }
+}
+
+//** Device-side storage for one species*/
+struct DeviceParticles {
+    FPpart* x = nullptr;
+    FPpart* y = nullptr;
+    FPpart* z = nullptr;
+    FPpart* u = nullptr;
+    FPpart* v = nullptr;
+    FPpart* w = nullptr;
+
+    long capacity_npmax = 0;  // allocated length
+};
+
+//** Global GPU context for mover (allocated once, reused each cycle) */
+struct MoverGPUContext {
+    bool initialized = false;
+
+    int  ns = 0;
+
+    // node dimensions for flattening node-based arrays
+    int nxn = 0;
+    int nyn = 0;
+    int nzn = 0;
+    long Nnodes = 0;
+
+    // cached grid scalars used by mover
+    FPfield invdx = 0.0f, invdy = 0.0f, invdz = 0.0f, invVOL = 0.0f;
+    FPpart  xStart = 0.0f, yStart = 0.0f, zStart = 0.0f;
+    FPpart  Lx = 0.0f, Ly = 0.0f, Lz = 0.0f;
+
+    // cached simulation constant(s)
+    FPpart c = 0.0f;
+
+    // device grid node coordinates (flat)
+    FPfield* d_XN = nullptr;
+    FPfield* d_YN = nullptr;
+    FPfield* d_ZN = nullptr;
+
+    // device fields (flat, node-based)
+    FPfield* d_Ex = nullptr;
+    FPfield* d_Ey = nullptr;
+    FPfield* d_Ez = nullptr;
+    FPfield* d_Bx = nullptr;
+    FPfield* d_By = nullptr;
+    FPfield* d_Bz = nullptr;
+
+    // per species device particle buffers
+    DeviceParticles* d_parts = nullptr;
+};
+
+static MoverGPUContext g_ctx;
+
+// ------------------------------------------------------------
+// CPU Mover
+// ------------------------------------------------------------
 
 /** allocate particle arrays */
 void particle_allocate(struct parameters* param, struct particles* part, int is)
@@ -232,7 +299,370 @@ int mover_PC(struct particles* part, struct EMfield* field, struct grid* grd, st
     return(0); // exit succcesfully
 } // end of the mover
 
+// ------------------------------------------------------------
+// GPU Mover
+// ------------------------------------------------------------
 
+//** CUDA kernel implementing the particle mover: one thread updates one particle
+//** over all subcycles and iterations */
+__global__ void mover_PC_kernel(
+    // particles (device)
+    FPpart* x, FPpart* y, FPpart* z,
+    FPpart* u, FPpart* v, FPpart* w,
+    long nop,
+
+    // fields on nodes (device, flat)
+    const FPfield* Ex, const FPfield* Ey, const FPfield* Ez,
+    const FPfield* Bx, const FPfield* By, const FPfield* Bz,
+
+    // grid node coordinates (device, flat)
+    const FPfield* XN, const FPfield* YN, const FPfield* ZN,
+
+    // node strides for flattening
+    int nyn, int nzn,
+
+    // grid scalars
+    FPfield invdx, FPfield invdy, FPfield invdz, FPfield invVOL,
+    FPpart xStart, FPpart yStart, FPpart zStart,
+    FPpart Lx, FPpart Ly, FPpart Lz,
+    int periodicX, int periodicY, int periodicZ,
+
+    // mover scalars
+    FPpart dt,
+    int n_sub_cycles,
+    int NiterMover,
+    FPpart qom,
+    FPpart c,
+
+    // node dimensions (for defensive clamping)
+    int nxn, int nyn_dim, int nzn_dim
+)
+{
+    long i = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (i >= nop) return;
+
+    // Load particle into registers
+    FPpart px = x[i], py = y[i], pz = z[i];
+    FPpart pu = u[i], pv = v[i], pw = w[i];
+
+    // Time step split into sub-cycles (same as CPU)
+    FPpart dt_sub = dt / (FPpart)n_sub_cycles;
+    FPpart dto2   = (FPpart)0.5f * dt_sub;
+    FPpart qomdt2 = qom * dto2 / c;
+
+    for (int sub = 0; sub < n_sub_cycles; sub++) {
+
+        // Save start-of-subcycle position
+        FPpart xpt = px, ypt = py, zpt = pz;
+
+        FPpart upt = 0.0f, vpt = 0.0f, wpt = 0.0f;
+
+        // Iterative average-velocity solve (same structure as CPU)
+        for (int it = 0; it < NiterMover; it++) {
+
+            int ix = 2 + (int)((px - xStart) * invdx);
+            int iy = 2 + (int)((py - yStart) * invdy);
+            int iz = 2 + (int)((pz - zStart) * invdz);
+
+            // Defensive clamping to avoid illegal indexing if a particle goes out-of-range
+            // We need ix-1 and ix to be valid, same for iy/iz, and we also access ix-ii with ii in {0,1}.
+            // So ix must be in [1, nxn-2], similarly for y,z.
+            if (ix < 1) ix = 1;
+            if (iy < 1) iy = 1;
+            if (iz < 1) iz = 1;
+            if (ix > nxn - 2) ix = nxn - 2;
+            if (iy > nyn_dim - 2) iy = nyn_dim - 2;
+            if (iz > nzn_dim - 2) iz = nzn_dim - 2;
+
+            // Distances to surrounding nodes (same as CPU, but flat indexing)
+            // Alloc.h flatten rule: get_idx(x,y,z, stride_y, stride_z)
+            FPfield xi0   = (FPfield)(px - XN[get_idx(ix - 1, iy,     iz,     (long)nyn, (long)nzn)]);
+            FPfield eta0  = (FPfield)(py - YN[get_idx(ix,     iy - 1, iz,     (long)nyn, (long)nzn)]);
+            FPfield zeta0 = (FPfield)(pz - ZN[get_idx(ix,     iy,     iz - 1, (long)nyn, (long)nzn)]);
+
+            FPfield xi1   = (FPfield)(XN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - px);
+            FPfield eta1  = (FPfield)(YN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - py);
+            FPfield zeta1 = (FPfield)(ZN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - pz);
+
+            // Interpolate E and B from 8 surrounding nodes (2x2x2)
+            FPfield Exl = 0.0f, Eyl = 0.0f, Ezl = 0.0f;
+            FPfield Bxl = 0.0f, Byl = 0.0f, Bzl = 0.0f;
+
+            for (int ii = 0; ii < 2; ii++) {
+                FPfield wx = (ii == 0) ? xi0 : xi1;
+                for (int jj = 0; jj < 2; jj++) {
+                    FPfield wy = (jj == 0) ? eta0 : eta1;
+                    for (int kk = 0; kk < 2; kk++) {
+                        FPfield wz = (kk == 0) ? zeta0 : zeta1;
+
+                        FPfield wgt = wx * wy * wz * invVOL;
+
+                        long gi = get_idx(ix - ii, iy - jj, iz - kk, (long)nyn, (long)nzn);
+
+                        Exl += wgt * Ex[gi];
+                        Eyl += wgt * Ey[gi];
+                        Ezl += wgt * Ez[gi];
+
+                        Bxl += wgt * Bx[gi];
+                        Byl += wgt * By[gi];
+                        Bzl += wgt * Bz[gi];
+                    }
+                }
+            }
+
+            // Boris-like update (same equations as CPU mover_PC)
+            FPpart omdtsq = qomdt2 * qomdt2 *
+                ((FPpart)Bxl * (FPpart)Bxl + (FPpart)Byl * (FPpart)Byl + (FPpart)Bzl * (FPpart)Bzl);
+
+            FPpart denom = (FPpart)1.0f / ((FPpart)1.0f + omdtsq);
+
+            FPpart ut = pu + qomdt2 * (FPpart)Exl;
+            FPpart vt = pv + qomdt2 * (FPpart)Eyl;
+            FPpart wt = pw + qomdt2 * (FPpart)Ezl;
+
+            FPpart udotb = ut * (FPpart)Bxl + vt * (FPpart)Byl + wt * (FPpart)Bzl;
+
+            upt = (ut + qomdt2 * (vt * (FPpart)Bzl - wt * (FPpart)Byl + qomdt2 * udotb * (FPpart)Bxl)) * denom;
+            vpt = (vt + qomdt2 * (wt * (FPpart)Bxl - ut * (FPpart)Bzl + qomdt2 * udotb * (FPpart)Byl)) * denom;
+            wpt = (wt + qomdt2 * (ut * (FPpart)Byl - vt * (FPpart)Bxl + qomdt2 * udotb * (FPpart)Bzl)) * denom;
+
+            // Half-step position update inside the iteration loop (same as CPU)
+            px = xpt + upt * dto2;
+            py = ypt + vpt * dto2;
+            pz = zpt + wpt * dto2;
+        }
+
+        // Final update for this subcycle (same as CPU)
+        pu = (FPpart)2.0f * upt - pu;
+        pv = (FPpart)2.0f * vpt - pv;
+        pw = (FPpart)2.0f * wpt - pw;
+
+        px = xpt + upt * dt_sub;
+        py = ypt + vpt * dt_sub;
+        pz = zpt + wpt * dt_sub;
+
+        // Boundary conditions (same logic as CPU mover_PC)
+        // X direction
+        if (px > Lx) {
+            if (periodicX) px -= Lx;
+            else { pu = -pu; px = (FPpart)2.0f * Lx - px; }
+        }
+        if (px < (FPpart)0.0f) {
+            if (periodicX) px += Lx;
+            else { pu = -pu; px = -px; }
+        }
+
+        // Y direction
+        if (py > Ly) {
+            if (periodicY) py -= Ly;
+            else { pv = -pv; py = (FPpart)2.0f * Ly - py; }
+        }
+        if (py < (FPpart)0.0f) {
+            if (periodicY) py += Ly;
+            else { pv = -pv; py = -py; }
+        }
+
+        // Z direction
+        if (pz > Lz) {
+            if (periodicZ) pz -= Lz;
+            else { pw = -pw; pz = (FPpart)2.0f * Lz - pz; }
+        }
+        if (pz < (FPpart)0.0f) {
+            if (periodicZ) pz += Lz;
+            else { pw = -pw; pz = -pz; }
+        }
+    }
+
+    // Store back to global memory
+    x[i] = px; y[i] = py; z[i] = pz;
+    u[i] = pu; v[i] = pv; w[i] = pw;
+}
+
+//** One-time initialization of GPU resources for the particle mover */
+void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* field, struct particles* parts)
+{
+    if (g_ctx.initialized) return;
+
+    g_ctx.initialized = true;
+    g_ctx.ns  = param->ns;
+
+    g_ctx.nxn = grd->nxn;
+    g_ctx.nyn = grd->nyn;
+    g_ctx.nzn = grd->nzn;
+    g_ctx.Nnodes = (long)g_ctx.nxn * (long)g_ctx.nyn * (long)g_ctx.nzn;
+
+    g_ctx.invdx  = grd->invdx;
+    g_ctx.invdy  = grd->invdy;
+    g_ctx.invdz  = grd->invdz;
+    g_ctx.invVOL = grd->invVOL;
+
+    g_ctx.xStart = (FPpart)grd->xStart;
+    g_ctx.yStart = (FPpart)grd->yStart;
+    g_ctx.zStart = (FPpart)grd->zStart;
+
+    g_ctx.Lx = (FPpart)grd->Lx;
+    g_ctx.Ly = (FPpart)grd->Ly;
+    g_ctx.Lz = (FPpart)grd->Lz;
+
+    g_ctx.c  = (FPpart)param->c;
+
+    // Allocate and copy grid node coordinates ONCE
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_XN, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_XN");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_YN, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_YN");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_ZN, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_ZN");
+
+    cudaCheck(cudaMemcpy(g_ctx.d_XN, grd->XN_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy XN_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_YN, grd->YN_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy YN_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_ZN, grd->ZN_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy ZN_flat");
+
+    // Allocate field arrays on device (contents updated each cycle)
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_Ex, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_Ex");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_Ey, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_Ey");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_Ez, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_Ez");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_Bx, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_Bx");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_By, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_By");
+    cudaCheck(cudaMalloc((void**)&g_ctx.d_Bz, g_ctx.Nnodes * sizeof(FPfield)), "cudaMalloc d_Bz");
+
+    // Allocate per-species particle arrays on device and copy initial data
+    g_ctx.d_parts = new DeviceParticles[g_ctx.ns];
+
+    for (int is = 0; is < g_ctx.ns; is++) {
+        DeviceParticles& dp = g_ctx.d_parts[is];
+        dp.capacity_npmax = parts[is].npmax;
+
+        cudaCheck(cudaMalloc((void**)&dp.x, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.x");
+        cudaCheck(cudaMalloc((void**)&dp.y, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.y");
+        cudaCheck(cudaMalloc((void**)&dp.z, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.z");
+        cudaCheck(cudaMalloc((void**)&dp.u, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.u");
+        cudaCheck(cudaMalloc((void**)&dp.v, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.v");
+        cudaCheck(cudaMalloc((void**)&dp.w, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.w");
+
+        // Copy only the active particles (nop)
+        long nop = parts[is].nop;
+        cudaCheck(cudaMemcpy(dp.x, parts[is].x, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.x H2D");
+        cudaCheck(cudaMemcpy(dp.y, parts[is].y, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.y H2D");
+        cudaCheck(cudaMemcpy(dp.z, parts[is].z, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.z H2D");
+        cudaCheck(cudaMemcpy(dp.u, parts[is].u, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.u H2D");
+        cudaCheck(cudaMemcpy(dp.v, parts[is].v, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.v H2D");
+        cudaCheck(cudaMemcpy(dp.w, parts[is].w, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.w H2D");
+    }
+
+    // Copy initial fields once
+    mover_gpu_update_fields(grd, field);
+}
+
+//** Update fields once per cycle (host -> device) */
+void mover_gpu_update_fields(struct grid* /*grd*/, struct EMfield* field)
+{
+    if (!g_ctx.initialized) {
+        std::fprintf(stderr, "mover_gpu_update_fields called before mover_gpu_init\n");
+        std::abort();
+    }
+
+    cudaCheck(cudaMemcpy(g_ctx.d_Ex, field->Ex_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Ex_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_Ey, field->Ey_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Ey_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_Ez, field->Ez_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Ez_flat");
+
+    cudaCheck(cudaMemcpy(g_ctx.d_Bx, field->Bxn_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Bxn_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_By, field->Byn_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Byn_flat");
+    cudaCheck(cudaMemcpy(g_ctx.d_Bz, field->Bzn_flat, g_ctx.Nnodes * sizeof(FPfield), cudaMemcpyHostToDevice), "Memcpy Bzn_flat");
+}
+
+//** Move one species on GPU, then copy particles back to host */
+int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters* param)
+{
+    if (!g_ctx.initialized) {
+        std::fprintf(stderr, "mover_PC_GPU called before mover_gpu_init\n");
+        return -1;
+    }
+
+    const int is = part->species_ID;
+    if (is < 0 || is >= g_ctx.ns) {
+        std::fprintf(stderr, "mover_PC_GPU: invalid species_ID = %d\n", is);
+        return -1;
+    }
+
+    DeviceParticles& dp = g_ctx.d_parts[is];
+
+    const long nop = part->nop;
+
+    // Launch configuration: one thread per particle
+    const int threads = 256;
+    const int blocks  = (int)((nop + threads - 1) / threads);
+
+    const int periodicX = param->PERIODICX ? 1 : 0;
+    const int periodicY = param->PERIODICY ? 1 : 0;
+    const int periodicZ = param->PERIODICZ ? 1 : 0;
+
+    mover_PC_kernel<<<blocks, threads>>>(
+        dp.x, dp.y, dp.z,
+        dp.u, dp.v, dp.w,
+        nop,
+        g_ctx.d_Ex, g_ctx.d_Ey, g_ctx.d_Ez,
+        g_ctx.d_Bx, g_ctx.d_By, g_ctx.d_Bz,
+        g_ctx.d_XN, g_ctx.d_YN, g_ctx.d_ZN,
+        g_ctx.nyn, g_ctx.nzn,
+        g_ctx.invdx, g_ctx.invdy, g_ctx.invdz, g_ctx.invVOL,
+        g_ctx.xStart, g_ctx.yStart, g_ctx.zStart,
+        g_ctx.Lx, g_ctx.Ly, g_ctx.Lz,
+        periodicX, periodicY, periodicZ,
+        (FPpart)param->dt,
+        part->n_sub_cycles,
+        part->NiterMover,
+        part->qom,
+        g_ctx.c,
+        g_ctx.nxn, g_ctx.nyn, g_ctx.nzn
+    );
+
+    cudaCheck(cudaGetLastError(), "kernel launch mover_PC_kernel");
+    cudaCheck(cudaDeviceSynchronize(), "kernel sync mover_PC_kernel");
+
+    // Copy results back to host so CPU pipeline (interp/output) works unchanged
+    cudaCheck(cudaMemcpy(part->x, dp.x, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy x D2H");
+    cudaCheck(cudaMemcpy(part->y, dp.y, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy y D2H");
+    cudaCheck(cudaMemcpy(part->z, dp.z, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy z D2H");
+    cudaCheck(cudaMemcpy(part->u, dp.u, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy u D2H");
+    cudaCheck(cudaMemcpy(part->v, dp.v, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy v D2H");
+    cudaCheck(cudaMemcpy(part->w, dp.w, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy w D2H");
+
+    return 0;
+}
+
+//** Free GPU resources at end of program*/
+void mover_gpu_finalize()
+{
+    if (!g_ctx.initialized) return;
+
+    // per-species particle buffers
+    if (g_ctx.d_parts) {
+        for (int is = 0; is < g_ctx.ns; is++) {
+            DeviceParticles& dp = g_ctx.d_parts[is];
+            if (dp.x) cudaFree(dp.x);
+            if (dp.y) cudaFree(dp.y);
+            if (dp.z) cudaFree(dp.z);
+            if (dp.u) cudaFree(dp.u);
+            if (dp.v) cudaFree(dp.v);
+            if (dp.w) cudaFree(dp.w);
+        }
+        delete[] g_ctx.d_parts;
+        g_ctx.d_parts = nullptr;
+    }
+
+    // grid node coordinates
+    if (g_ctx.d_XN) cudaFree(g_ctx.d_XN);
+    if (g_ctx.d_YN) cudaFree(g_ctx.d_YN);
+    if (g_ctx.d_ZN) cudaFree(g_ctx.d_ZN);
+
+    // fields
+    if (g_ctx.d_Ex) cudaFree(g_ctx.d_Ex);
+    if (g_ctx.d_Ey) cudaFree(g_ctx.d_Ey);
+    if (g_ctx.d_Ez) cudaFree(g_ctx.d_Ez);
+    if (g_ctx.d_Bx) cudaFree(g_ctx.d_Bx);
+    if (g_ctx.d_By) cudaFree(g_ctx.d_By);
+    if (g_ctx.d_Bz) cudaFree(g_ctx.d_Bz);
+
+    g_ctx = MoverGPUContext{};
+} // End of GPU mover
 
 /** Interpolation Particle --> Grid: This is for species */
 void interpP2G(struct particles* part, struct interpDensSpecies* ids, struct grid* grd)
