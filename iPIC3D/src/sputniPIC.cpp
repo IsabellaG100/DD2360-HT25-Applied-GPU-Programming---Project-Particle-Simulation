@@ -73,6 +73,9 @@ int main(int argc, char **argv){
     
     // Initialization
     initGEM(&param,&grd,&field,&field_aux,part,ids);
+
+    // GPU mover setup (allocate device memory once)
+    mover_gpu_init(&param, &grd, &field, part);
     
     
     // **********************************************************//
@@ -88,12 +91,14 @@ int main(int argc, char **argv){
         // set to zero the densities - needed for interpolation
         setZeroDensities(&idn,ids,&grd,param.ns);
         
-        
+        // Update E/B on the GPU once per cycle (host -> device).
+        mover_gpu_update_fields(&grd, &field);
         
         // implicit mover
         iMover = cpuSecond(); // start timer for mover
         for (int is=0; is < param.ns; is++)
-            mover_PC(&part[is],&field,&grd,&param);
+            mover_PC_GPU(&part[is], &grd, &param);
+            //mover_PC(&part[is],&field,&grd,&param);
         eMover += (cpuSecond() - iMover); // stop timer for mover
         
         
@@ -126,7 +131,10 @@ int main(int argc, char **argv){
     
     }  // end of one PIC cycle
     
-    /// Release the resources
+    // Release device resources
+    mover_gpu_finalize();
+
+    /// Release host resources
     // deallocate field
     grid_deallocate(&grd);
     field_deallocate(&grd,&field);
