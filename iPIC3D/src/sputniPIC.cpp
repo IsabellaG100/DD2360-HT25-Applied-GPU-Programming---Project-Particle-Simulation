@@ -20,6 +20,7 @@
 // Particles structure
 #include "Particles.h"
 #include "Particles_aux.h" // Needed only if dointerpolation on GPU - avoid reduction on GPU
+#include "ParticlesGPU.h"
 
 // Initial Condition
 #include "IC.h"
@@ -77,6 +78,9 @@ int main(int argc, char **argv){
     // GPU mover setup (allocate device memory once)
     mover_gpu_init(&param, &grd, &field, part);
     
+    // Allocate device memory for interpolation (once)
+    interp_gpu_init(&param, &grd, ids);
+
     
     // **********************************************************//
     // **** Start the Simulation!  Cycle index start from 1  *** //
@@ -108,7 +112,8 @@ int main(int argc, char **argv){
         iInterp = cpuSecond(); // start timer for the interpolation step
         // interpolate species
         for (int is=0; is < param.ns; is++)
-            interpP2G(&part[is],&ids[is],&grd);
+            interpP2G_GPU(&part[is], &ids[is], &grd);
+            //interpP2G(&part[is],&ids[is],&grd);
         // apply BC to interpolated densities
         for (int is=0; is < param.ns; is++)
             applyBCids(&ids[is],&grd,&param);
@@ -133,6 +138,7 @@ int main(int argc, char **argv){
     
     // Release device resources
     mover_gpu_finalize();
+    interp_gpu_finalize();
 
     /// Release host resources
     // deallocate field
