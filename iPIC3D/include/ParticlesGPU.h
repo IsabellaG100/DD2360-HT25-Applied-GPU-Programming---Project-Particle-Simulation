@@ -6,7 +6,7 @@
 #include "EMfield.h"
 
 // ------------------------------
-// GPU mover API
+// GPU mover 
 // ------------------------------
 
 /** Initialize and allocate GPU resources for the particle mover (one-time). */
@@ -22,7 +22,7 @@ int mover_PC_GPU(struct particles* part, struct grid* grd, struct parameters* pa
 void mover_gpu_finalize();
 
 // ------------------------------
-// GPU interpolation (P2G) API
+// GPU interpolation (P2G) 
 // ------------------------------
 
 /** Initialize and allocate GPU resources for P2G interpolation (one-time). */
