@@ -95,7 +95,7 @@ int main(int argc, char **argv){
         // set to zero the densities - needed for interpolation
         setZeroDensities(&idn,ids,&grd,param.ns); 
         
-        // Update E/B on the GPU once per cycle (host -> device).
+        // Update E/B fields on the GPU once per cycle (host -> device).
         mover_gpu_update_fields(&grd, &field);
         
         // implicit mover
