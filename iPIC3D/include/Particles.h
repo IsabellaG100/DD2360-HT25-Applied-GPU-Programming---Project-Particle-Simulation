@@ -58,10 +58,10 @@ void particle_allocate(struct parameters*, struct particles*, int);
 /** deallocate */
 void particle_deallocate(struct particles*);
 
-/** particle mover */
+/** particle mover CPU*/
 int mover_PC(struct particles*, struct EMfield*, struct grid*, struct parameters*);
 
-/** Interpolation Particle --> Grid: This is for species */
+/** Interpolation Particle --> Grid: This is for species CPU */
 void interpP2G(struct particles*, struct interpDensSpecies*, struct grid*);
 
 #endif
