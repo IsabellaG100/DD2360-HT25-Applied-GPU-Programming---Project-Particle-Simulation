@@ -8,6 +8,7 @@ This project focuses on accelerating a simplified particle-in-cell plasma simula
 In particular, the particle mover and particle-to-grid (P2G) interpolation routines are targeted, as they dominate the overall runtime and operate over large numbers of independent particles. Performance profiling is used throughout the project to guide optimization decisions and to support a comparison between the CPU and GPU implementations.
 
 # Repository Structure
+```text
 ├── src/                  # Source files (CPU and GPU implementations)
 │   ├── Particles.cu      # Particle mover and P2G kernels
 │   ├── EMfield.cpp
@@ -18,6 +19,7 @@ In particular, the particle mover and particle-to-grid (P2G) interpolation routi
 ├── scripts/              # Profiling and validation scripts
 ├── Makefile
 └── README.md
+```
 
 # Build instructions
 We recommend running the code in Google Colab. The repository with instructions can be found here:
