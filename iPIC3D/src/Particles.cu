@@ -1,10 +1,20 @@
+// Particles structure
 #include "Particles.h"
+// Helper functions
 #include "Alloc.h"
+// Precision: fix precision for different quantities
 #include "PrecisionTypes.h"
+// Defines functions for GPU  
+#include "ParticlesGPU.h"
+// CUDA header files
 #include <cuda.h>
 #include <cuda_runtime.h>
+// Standard Input/Output
 #include <cstdio>
+// Utilities 
 #include <cstdlib>
+// For math
+#include <cmath>
 
 //** CUDA error checking helper*/
 static inline void cudaCheck(cudaError_t err, const char* what)
@@ -23,6 +33,7 @@ struct DeviceParticles {
     FPpart* u = nullptr;
     FPpart* v = nullptr;
     FPpart* w = nullptr;
+    FPinterp* q = nullptr;
 
     long capacity_npmax = 0;  // allocated length
 };
@@ -64,7 +75,45 @@ struct MoverGPUContext {
     DeviceParticles* d_parts = nullptr;
 };
 
+// Gloabal instance
 static MoverGPUContext g_ctx;
+
+///** GPU InterpP2G context (allocated once, reused each cycle) */
+
+struct DeviceInterpDensSpecies {
+    FPinterp* rhon = nullptr;
+    FPinterp* rhoc = nullptr; // not used in interpP2G, but kept for completeness if needed later
+
+    FPinterp* Jx = nullptr;
+    FPinterp* Jy = nullptr;
+    FPinterp* Jz = nullptr;
+
+    FPinterp* pxx = nullptr;
+    FPinterp* pxy = nullptr;
+    FPinterp* pxz = nullptr;
+    FPinterp* pyy = nullptr;
+    FPinterp* pyz = nullptr;
+    FPinterp* pzz = nullptr;
+};
+
+struct InterpGPUContext {
+    bool initialized = false;
+
+    int ns = 0;
+
+    int nxn = 0, nyn = 0, nzn = 0;
+    long Nnodes = 0;
+
+    FPfield invdx = 0.0f, invdy = 0.0f, invdz = 0.0f, invVOL = 0.0f;
+    FPpart  xStart = 0.0f, yStart = 0.0f, zStart = 0.0f;
+
+    // We reuse device node coords from mover context (g_ctx.d_XN etc).
+    // So no separate d_XN/d_YN/d_ZN here.
+
+    DeviceInterpDensSpecies* d_ids = nullptr; // length ns, host-side array holding device pointers
+};
+
+static InterpGPUContext g_interp;
 
 // ------------------------------------------------------------
 // CPU Mover
@@ -139,7 +188,7 @@ void particle_deallocate(struct particles* part)
     delete[] part->q;
 }
 
-/** particle mover */
+/** particle mover on CPU */
 int mover_PC(struct particles* part, struct EMfield* field, struct grid* grd, struct parameters* param)
 {
     // print species and subcycling
@@ -483,6 +532,7 @@ void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* 
 {
     if (g_ctx.initialized) return;
 
+    // Update struct with scalars from parameters and grid
     g_ctx.initialized = true;
     g_ctx.ns  = param->ns;
 
@@ -536,6 +586,8 @@ void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* 
         cudaCheck(cudaMalloc((void**)&dp.u, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.u");
         cudaCheck(cudaMalloc((void**)&dp.v, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.v");
         cudaCheck(cudaMalloc((void**)&dp.w, dp.capacity_npmax * sizeof(FPpart)), "cudaMalloc dp.w");
+        cudaCheck(cudaMalloc((void**)&dp.q, dp.capacity_npmax * sizeof(FPinterp)), "cudaMalloc dp.q");
+
 
         // Copy only the active particles (nop)
         long nop = parts[is].nop;
@@ -545,6 +597,7 @@ void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* 
         cudaCheck(cudaMemcpy(dp.u, parts[is].u, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.u H2D");
         cudaCheck(cudaMemcpy(dp.v, parts[is].v, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.v H2D");
         cudaCheck(cudaMemcpy(dp.w, parts[is].w, nop * sizeof(FPpart), cudaMemcpyHostToDevice), "Memcpy part.w H2D");
+        cudaCheck(cudaMemcpy(dp.q, parts[is].q, nop * sizeof(FPinterp), cudaMemcpyHostToDevice), "Memcpy part.q H2D");
     }
 
     // Copy initial fields once
@@ -571,6 +624,7 @@ void mover_gpu_update_fields(struct grid* /*grd*/, struct EMfield* field)
 //** Move one species on GPU, then copy particles back to host */
 int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters* param)
 {
+    // Error checking
     if (!g_ctx.initialized) {
         std::fprintf(stderr, "mover_PC_GPU called before mover_gpu_init\n");
         return -1;
@@ -594,6 +648,7 @@ int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters
     const int periodicY = param->PERIODICY ? 1 : 0;
     const int periodicZ = param->PERIODICZ ? 1 : 0;
 
+    // Launch kernel
     mover_PC_kernel<<<blocks, threads>>>(
         dp.x, dp.y, dp.z,
         dp.u, dp.v, dp.w,
@@ -614,10 +669,11 @@ int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters
         g_ctx.nxn, g_ctx.nyn, g_ctx.nzn
     );
 
+
     cudaCheck(cudaGetLastError(), "kernel launch mover_PC_kernel");
     cudaCheck(cudaDeviceSynchronize(), "kernel sync mover_PC_kernel");
 
-    // Copy results back to host so CPU pipeline (interp/output) works unchanged
+    // Copy results back to host so CPU pipeline (interp/output) works unchanged 
     cudaCheck(cudaMemcpy(part->x, dp.x, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy x D2H");
     cudaCheck(cudaMemcpy(part->y, dp.y, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy y D2H");
     cudaCheck(cudaMemcpy(part->z, dp.z, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy z D2H");
@@ -643,6 +699,7 @@ void mover_gpu_finalize()
             if (dp.u) cudaFree(dp.u);
             if (dp.v) cudaFree(dp.v);
             if (dp.w) cudaFree(dp.w);
+            if (dp.q) cudaFree(dp.q);
         }
         delete[] g_ctx.d_parts;
         g_ctx.d_parts = nullptr;
@@ -664,6 +721,11 @@ void mover_gpu_finalize()
     g_ctx = MoverGPUContext{};
 } // End of GPU mover
 
+// ------------------------------------------------------------
+// CPU Interpolation
+// ------------------------------------------------------------
+
+//** CPU Interpolation */
 /** Interpolation Particle --> Grid: This is for species */
 void interpP2G(struct particles* part, struct interpDensSpecies* ids, struct grid* grd)
 {
@@ -818,4 +880,281 @@ void interpP2G(struct particles* part, struct interpDensSpecies* ids, struct gri
     
     }
    
+}
+
+// ------------------------------------------------------------
+// GPU Interpolation
+// ------------------------------------------------------------
+
+//** safe wrapper for atomic add */
+__device__ __forceinline__ void atomicAddFPinterp(FPinterp* addr, FPinterp val) {
+    atomicAdd(addr, val);
+}
+
+//** GPU interpolation */
+__global__ void interpP2G_kernel(
+    // particles (device)
+    const FPpart* x, const FPpart* y, const FPpart* z,
+    const FPpart* u, const FPpart* v, const FPpart* w,
+    const FPinterp* q,
+    long nop,
+
+    // grid node coordinates (device, flat)
+    const FPfield* XN, const FPfield* YN, const FPfield* ZN,
+
+    // strides + dims
+    int nyn, int nzn,
+    int nxn_dim, int nyn_dim, int nzn_dim,
+
+    // grid scalars
+    FPfield invdx, FPfield invdy, FPfield invdz, FPfield invVOL,
+    FPpart xStart, FPpart yStart, FPpart zStart,
+
+    // outputs (device, flat)
+    FPinterp* rhon,
+    FPinterp* Jx, FPinterp* Jy, FPinterp* Jz,
+    FPinterp* pxx, FPinterp* pxy, FPinterp* pxz,
+    FPinterp* pyy, FPinterp* pyz, FPinterp* pzz
+)
+{
+    long i = (long)blockIdx.x * (long)blockDim.x + (long)threadIdx.x;
+    if (i >= nop) return;
+
+    // Load particle
+    FPpart px = x[i], py = y[i], pz = z[i];
+    FPpart pu = u[i], pv = v[i], pw = w[i];
+    FPinterp pq = q[i];
+
+    // Cell index (match CPU: ix = 2 + floor((x-xStart)*invdx))
+    int ix = 2 + (int)floor((px - xStart) * (FPpart)invdx);
+    int iy = 2 + (int)floor((py - yStart) * (FPpart)invdy);
+    int iz = 2 + (int)floor((pz - zStart) * (FPpart)invdz);
+
+    // Defensive clamp (avoid illegal access)
+    if (ix < 1) ix = 1;
+    if (iy < 1) iy = 1;
+    if (iz < 1) iz = 1;
+    if (ix > nxn_dim - 2) ix = nxn_dim - 2;
+    if (iy > nyn_dim - 2) iy = nyn_dim - 2;
+    if (iz > nzn_dim - 2) iz = nzn_dim - 2;
+
+    // Distances from nodes using flattened arrays + get_idx
+    FPpart xi0   = px - (FPpart)XN[get_idx(ix - 1, iy,     iz,     (long)nyn, (long)nzn)];
+    FPpart eta0  = py - (FPpart)YN[get_idx(ix,     iy - 1, iz,     (long)nyn, (long)nzn)];
+    FPpart zeta0 = pz - (FPpart)ZN[get_idx(ix,     iy,     iz - 1, (long)nyn, (long)nzn)];
+
+    FPpart xi1   = (FPpart)XN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - px;
+    FPpart eta1  = (FPpart)YN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - py;
+    FPpart zeta1 = (FPpart)ZN[get_idx(ix, iy, iz, (long)nyn, (long)nzn)] - pz;
+
+    // Deposit to 8 surrounding nodes
+    for (int ii = 0; ii < 2; ii++) {
+        FPpart wx = (ii == 0) ? xi0 : xi1;
+        for (int jj = 0; jj < 2; jj++) {
+            FPpart wy = (jj == 0) ? eta0 : eta1;
+            for (int kk = 0; kk < 2; kk++) {
+                FPpart wz = (kk == 0) ? zeta0 : zeta1;
+
+                long g = get_idx(ix - ii, iy - jj, iz - kk, (long)nyn, (long)nzn);
+
+                // CPU does: weight = q * xi * eta * zeta * invVOL
+                // and then adds weight * invVOL to arrays.
+                // So overall: q * xi * eta * zeta * invVOL^2
+                FPinterp weight = (FPinterp)(pq * (FPinterp)wx * (FPinterp)wy * (FPinterp)wz * (FPinterp)invVOL);
+                FPinterp dep = weight * (FPinterp)invVOL;
+
+                atomicAddFPinterp(&rhon[g], dep);
+
+                atomicAddFPinterp(&Jx[g], (FPinterp)pu * dep);
+                atomicAddFPinterp(&Jy[g], (FPinterp)pv * dep);
+                atomicAddFPinterp(&Jz[g], (FPinterp)pw * dep);
+
+                atomicAddFPinterp(&pxx[g], (FPinterp)(pu * pu) * dep);
+                atomicAddFPinterp(&pxy[g], (FPinterp)(pu * pv) * dep);
+                atomicAddFPinterp(&pxz[g], (FPinterp)(pu * pw) * dep);
+
+                atomicAddFPinterp(&pyy[g], (FPinterp)(pv * pv) * dep);
+                atomicAddFPinterp(&pyz[g], (FPinterp)(pv * pw) * dep);
+                atomicAddFPinterp(&pzz[g], (FPinterp)(pw * pw) * dep);
+            }
+        }
+    }
+}
+
+/** initialization of GPU resources for the Interpolation P2G */
+void interp_gpu_init(struct parameters* param, struct grid* grd, struct interpDensSpecies* ids_host)
+{
+    // Error checking
+    if (g_interp.initialized) return;
+
+    if (!g_ctx.initialized) {
+        std::fprintf(stderr, "interp_gpu_init requires mover_gpu_init first (for d_XN/d_YN/d_ZN)\n");
+        std::abort();
+    }
+
+    // Assign scalar from param and grid
+    g_interp.initialized = true;
+    g_interp.ns = param->ns;
+
+    g_interp.nxn = grd->nxn;
+    g_interp.nyn = grd->nyn;
+    g_interp.nzn = grd->nzn;
+    g_interp.Nnodes = (long)g_interp.nxn * (long)g_interp.nyn * (long)g_interp.nzn;
+
+    g_interp.invdx  = grd->invdx;
+    g_interp.invdy  = grd->invdy;
+    g_interp.invdz  = grd->invdz;
+    g_interp.invVOL = grd->invVOL;
+
+    g_interp.xStart = (FPpart)grd->xStart;
+    g_interp.yStart = (FPpart)grd->yStart;
+    g_interp.zStart = (FPpart)grd->zStart;
+
+    // look up for where species data is
+    g_interp.d_ids = new DeviceInterpDensSpecies[g_interp.ns];
+
+    size_t bytes = (size_t)g_interp.Nnodes * sizeof(FPinterp);
+
+    // iterate through species and allocate densities
+    for (int is = 0; is < g_interp.ns; is++) {
+        DeviceInterpDensSpecies& did = g_interp.d_ids[is];
+
+        cudaCheck(cudaMalloc((void**)&did.rhon, bytes), "cudaMalloc did.rhon");
+        cudaCheck(cudaMalloc((void**)&did.Jx,   bytes), "cudaMalloc did.Jx");
+        cudaCheck(cudaMalloc((void**)&did.Jy,   bytes), "cudaMalloc did.Jy");
+        cudaCheck(cudaMalloc((void**)&did.Jz,   bytes), "cudaMalloc did.Jz");
+        cudaCheck(cudaMalloc((void**)&did.pxx,  bytes), "cudaMalloc did.pxx");
+        cudaCheck(cudaMalloc((void**)&did.pxy,  bytes), "cudaMalloc did.pxy");
+        cudaCheck(cudaMalloc((void**)&did.pxz,  bytes), "cudaMalloc did.pxz");
+        cudaCheck(cudaMalloc((void**)&did.pyy,  bytes), "cudaMalloc did.pyy");
+        cudaCheck(cudaMalloc((void**)&did.pyz,  bytes), "cudaMalloc did.pyz");
+        cudaCheck(cudaMalloc((void**)&did.pzz,  bytes), "cudaMalloc did.pzz");
+
+        // Optional: if you later need rhoc etc
+        (void)ids_host; // suppress unused warning if not used yet
+    }
+
+    // Start zeroed
+    // (We will zero every cycle anyway.)
+}
+
+/** Resets all density and pressure tensor buffers to zero on the GPU for a specific species 
+ *  Called before every new species
+*/
+void interp_gpu_zero_species(int is)
+{
+    if (!g_interp.initialized) {
+        std::fprintf(stderr, "interp_gpu_zero_species called before interp_gpu_init\n");
+        std::abort();
+    }
+
+    // Resetting everyting to 0
+    DeviceInterpDensSpecies& did = g_interp.d_ids[is];
+    size_t bytes = (size_t)g_interp.Nnodes * sizeof(FPinterp);
+
+    cudaCheck(cudaMemset(did.rhon, 0, bytes), "memset rhon");
+    cudaCheck(cudaMemset(did.Jx,   0, bytes), "memset Jx");
+    cudaCheck(cudaMemset(did.Jy,   0, bytes), "memset Jy");
+    cudaCheck(cudaMemset(did.Jz,   0, bytes), "memset Jz");
+    cudaCheck(cudaMemset(did.pxx,  0, bytes), "memset pxx");
+    cudaCheck(cudaMemset(did.pxy,  0, bytes), "memset pxy");
+    cudaCheck(cudaMemset(did.pxz,  0, bytes), "memset pxz");
+    cudaCheck(cudaMemset(did.pyy,  0, bytes), "memset pyy");
+    cudaCheck(cudaMemset(did.pyz,  0, bytes), "memset pyz");
+    cudaCheck(cudaMemset(did.pzz,  0, bytes), "memset pzz");
+}
+
+/** Launches the interpolation kernel and calls the resetting function */
+void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, struct grid* /*grd*/)
+{
+    // Error checking
+    if (!g_interp.initialized) {
+        std::fprintf(stderr, "interpP2G_GPU called before interp_gpu_init\n");
+        std::abort();
+    }
+    if (!g_ctx.initialized) {
+        std::fprintf(stderr, "interpP2G_GPU called before mover_gpu_init\n");
+        std::abort();
+    }
+
+    int is = part->species_ID;
+    if (is < 0 || is >= g_interp.ns) {
+        std::fprintf(stderr, "interpP2G_GPU: invalid species_ID=%d\n", is);
+        std::abort();
+    }
+
+    // Zero device densities for this species 
+    interp_gpu_zero_species(is);
+
+
+    // Configuration for the kernel
+    DeviceParticles& dp = g_ctx.d_parts[is];
+    DeviceInterpDensSpecies& did = g_interp.d_ids[is];
+
+    long nop = part->nop;
+
+    int threads = 256;
+    int blocks  = (int)((nop + threads - 1) / threads);
+
+    // Launching the kernel
+    interpP2G_kernel<<<blocks, threads>>>(
+        dp.x, dp.y, dp.z,
+        dp.u, dp.v, dp.w,
+        dp.q,
+        nop,
+        g_ctx.d_XN, g_ctx.d_YN, g_ctx.d_ZN,
+        g_interp.nyn, g_interp.nzn,
+        g_interp.nxn, g_interp.nyn, g_interp.nzn,
+        g_interp.invdx, g_interp.invdy, g_interp.invdz, g_interp.invVOL,
+        g_interp.xStart, g_interp.yStart, g_interp.zStart,
+        did.rhon,
+        did.Jx, did.Jy, did.Jz,
+        did.pxx, did.pxy, did.pxz,
+        did.pyy, did.pyz, did.pzz
+    );
+
+    // Synchronization
+    cudaCheck(cudaGetLastError(), "kernel launch interpP2G_kernel");
+    cudaCheck(cudaDeviceSynchronize(), "kernel sync interpP2G_kernel");
+
+    // Copy device flat arrays back to host flat arrays, so CPU pointer-chains see updated data
+    size_t bytes = (size_t)g_interp.Nnodes * sizeof(FPinterp);
+
+    cudaCheck(cudaMemcpy(ids_host->rhon_flat, did.rhon, bytes, cudaMemcpyDeviceToHost), "Memcpy rhon D2H");
+    cudaCheck(cudaMemcpy(ids_host->Jx_flat,   did.Jx,   bytes, cudaMemcpyDeviceToHost), "Memcpy Jx D2H");
+    cudaCheck(cudaMemcpy(ids_host->Jy_flat,   did.Jy,   bytes, cudaMemcpyDeviceToHost), "Memcpy Jy D2H");
+    cudaCheck(cudaMemcpy(ids_host->Jz_flat,   did.Jz,   bytes, cudaMemcpyDeviceToHost), "Memcpy Jz D2H");
+    cudaCheck(cudaMemcpy(ids_host->pxx_flat,  did.pxx,  bytes, cudaMemcpyDeviceToHost), "Memcpy pxx D2H");
+    cudaCheck(cudaMemcpy(ids_host->pxy_flat,  did.pxy,  bytes, cudaMemcpyDeviceToHost), "Memcpy pxy D2H");
+    cudaCheck(cudaMemcpy(ids_host->pxz_flat,  did.pxz,  bytes, cudaMemcpyDeviceToHost), "Memcpy pxz D2H");
+    cudaCheck(cudaMemcpy(ids_host->pyy_flat,  did.pyy,  bytes, cudaMemcpyDeviceToHost), "Memcpy pyy D2H");
+    cudaCheck(cudaMemcpy(ids_host->pyz_flat,  did.pyz,  bytes, cudaMemcpyDeviceToHost), "Memcpy pyz D2H");
+    cudaCheck(cudaMemcpy(ids_host->pzz_flat,  did.pzz,  bytes, cudaMemcpyDeviceToHost), "Memcpy pzz D2H");
+}
+/** Realease GPU resources used for the interpolation context */
+void interp_gpu_finalize()
+{
+    // Error checking
+    if (!g_interp.initialized) return;
+
+    // realease memory
+    if (g_interp.d_ids) {
+        for (int is = 0; is < g_interp.ns; is++) {
+            DeviceInterpDensSpecies& did = g_interp.d_ids[is];
+            if (did.rhon) cudaFree(did.rhon);
+            if (did.Jx)   cudaFree(did.Jx);
+            if (did.Jy)   cudaFree(did.Jy);
+            if (did.Jz)   cudaFree(did.Jz);
+            if (did.pxx)  cudaFree(did.pxx);
+            if (did.pxy)  cudaFree(did.pxy);
+            if (did.pxz)  cudaFree(did.pxz);
+            if (did.pyy)  cudaFree(did.pyy);
+            if (did.pyz)  cudaFree(did.pyz);
+            if (did.pzz)  cudaFree(did.pzz);
+        }
+        delete[] g_interp.d_ids;
+        g_interp.d_ids = nullptr;
+    }
+
+    g_interp = InterpGPUContext{};
 }

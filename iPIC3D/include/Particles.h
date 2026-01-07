@@ -58,26 +58,10 @@ void particle_allocate(struct parameters*, struct particles*, int);
 /** deallocate */
 void particle_deallocate(struct particles*);
 
-/** particle mover */
+/** particle mover CPU*/
 int mover_PC(struct particles*, struct EMfield*, struct grid*, struct parameters*);
 
-/** Interpolation Particle --> Grid: This is for species */
+/** Interpolation Particle --> Grid: This is for species CPU */
 void interpP2G(struct particles*, struct interpDensSpecies*, struct grid*);
-
-// ------------------------------
-// GPU mover API
-// ------------------------------
-
-/** Initialize GPU resources for the particle mover */ 
-void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* field, struct particles* parts);
-
-/** Update electromagnetic field data on the GPU*/
-void mover_gpu_update_fields(struct grid* grd, struct EMfield* field);
-
-/** GPU particle mover */
-int mover_PC_GPU(struct particles* part, struct grid* grd, struct parameters* param);
-
-/** Release GPU resources associated with the particle mover */
-void mover_gpu_finalize();
 
 #endif
