@@ -5,52 +5,63 @@ void interp_dens_species_allocate(struct grid* grd, struct interpDensSpecies* id
 {
     // set species ID
     ids->species_ID = is;
-    
-    // allocate 3D arrays
-    // rho: 1
-    ids->rhon = newArr3<FPinterp>(&ids->rhon_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    ids->rhoc = newArr3<FPinterp>(&ids->rhoc_flat, grd->nxc, grd->nyc, grd->nzc); // center
-    // Jx: 2
-    ids->Jx   = newArr3<FPinterp>(&ids->Jx_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Jy: 3
-    ids->Jy   = newArr3<FPinterp>(&ids->Jy_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Jz: 4
-    ids->Jz   = newArr3<FPinterp>(&ids->Jz_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pxx: 5
-    ids->pxx  = newArr3<FPinterp>(&ids->pxx_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pxy: 6
-    ids->pxy  = newArr3<FPinterp>(&ids->pxy_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pxz: 7
-    ids->pxz  = newArr3<FPinterp>(&ids->pxz_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pyy: 8
-    ids->pyy  = newArr3<FPinterp>(&ids->pyy_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pyz: 9
-    ids->pyz  = newArr3<FPinterp>(&ids->pyz_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    // Pzz: 10
-    ids->pzz  = newArr3<FPinterp>(&ids->pzz_flat, grd->nxn, grd->nyn, grd->nzn); // nodes
-    
+
+    // --- Node-based arrays: allocate as PINNED (copied back from GPU every cycle) ---
+    ids->rhon = newArr3Pinned<FPinterp>(&ids->rhon_flat, grd->nxn, grd->nyn, grd->nzn);
+
+    ids->Jx   = newArr3Pinned<FPinterp>(&ids->Jx_flat,   grd->nxn, grd->nyn, grd->nzn);
+    ids->Jy   = newArr3Pinned<FPinterp>(&ids->Jy_flat,   grd->nxn, grd->nyn, grd->nzn);
+    ids->Jz   = newArr3Pinned<FPinterp>(&ids->Jz_flat,   grd->nxn, grd->nyn, grd->nzn);
+
+    ids->pxx  = newArr3Pinned<FPinterp>(&ids->pxx_flat,  grd->nxn, grd->nyn, grd->nzn);
+    ids->pxy  = newArr3Pinned<FPinterp>(&ids->pxy_flat,  grd->nxn, grd->nyn, grd->nzn);
+    ids->pxz  = newArr3Pinned<FPinterp>(&ids->pxz_flat,  grd->nxn, grd->nyn, grd->nzn);
+
+    ids->pyy  = newArr3Pinned<FPinterp>(&ids->pyy_flat,  grd->nxn, grd->nyn, grd->nzn);
+    ids->pyz  = newArr3Pinned<FPinterp>(&ids->pyz_flat,  grd->nxn, grd->nyn, grd->nzn);
+    ids->pzz  = newArr3Pinned<FPinterp>(&ids->pzz_flat,  grd->nxn, grd->nyn, grd->nzn);
+
+    // --- Center-based array: keep original allocator (typically CPU-only usage) ---
+    ids->rhoc = newArr3<FPinterp>(&ids->rhoc_flat, grd->nxc, grd->nyc, grd->nzc);
 }
 
 /** deallocate interpolated densities per species */
 void interp_dens_species_deallocate(struct grid* grd, struct interpDensSpecies* ids)
 {
-    
-    // deallocate 3D arrays
-    delArr3(ids->rhon, grd->nxn, grd->nyn);
+    // --- Free pinned node-based arrays ---
+    delArr3Pinned(ids->rhon, ids->rhon_flat);
+    ids->rhon = nullptr; ids->rhon_flat = nullptr;
+
+    delArr3Pinned(ids->Jx, ids->Jx_flat);
+    ids->Jx = nullptr; ids->Jx_flat = nullptr;
+
+    delArr3Pinned(ids->Jy, ids->Jy_flat);
+    ids->Jy = nullptr; ids->Jy_flat = nullptr;
+
+    delArr3Pinned(ids->Jz, ids->Jz_flat);
+    ids->Jz = nullptr; ids->Jz_flat = nullptr;
+
+    delArr3Pinned(ids->pxx, ids->pxx_flat);
+    ids->pxx = nullptr; ids->pxx_flat = nullptr;
+
+    delArr3Pinned(ids->pxy, ids->pxy_flat);
+    ids->pxy = nullptr; ids->pxy_flat = nullptr;
+
+    delArr3Pinned(ids->pxz, ids->pxz_flat);
+    ids->pxz = nullptr; ids->pxz_flat = nullptr;
+
+    delArr3Pinned(ids->pyy, ids->pyy_flat);
+    ids->pyy = nullptr; ids->pyy_flat = nullptr;
+
+    delArr3Pinned(ids->pyz, ids->pyz_flat);
+    ids->pyz = nullptr; ids->pyz_flat = nullptr;
+
+    delArr3Pinned(ids->pzz, ids->pzz_flat);
+    ids->pzz = nullptr; ids->pzz_flat = nullptr;
+
+    // --- Free center-based array (non-pinned, allocated by newArr3) ---
     delArr3(ids->rhoc, grd->nxc, grd->nyc);
-    // deallocate 3D arrays: J - current
-    delArr3(ids->Jx, grd->nxn, grd->nyn);
-    delArr3(ids->Jy, grd->nxn, grd->nyn);
-    delArr3(ids->Jz, grd->nxn, grd->nyn);
-    // deallocate 3D arrays: pressure
-    delArr3(ids->pxx, grd->nxn, grd->nyn);
-    delArr3(ids->pxy, grd->nxn, grd->nyn);
-    delArr3(ids->pxz, grd->nxn, grd->nyn);
-    delArr3(ids->pyy, grd->nxn, grd->nyn);
-    delArr3(ids->pyz, grd->nxn, grd->nyn);
-    delArr3(ids->pzz, grd->nxn, grd->nyn);
-    
-    
+    ids->rhoc = nullptr; ids->rhoc_flat = nullptr;
 }
 
 /** deallocate interpolated densities per species */

@@ -1,6 +1,7 @@
 #ifndef Alloc_H
 #define Alloc_H
 #include <cstdio>
+#include <cstdlib> 
 #include <cuda_runtime.h>
 
 __host__ __device__
@@ -167,5 +168,51 @@ template <class type> inline void delArr4(type **** arr, size_t sz1, size_t sz2,
 #define newArr2(type, sz1, sz2) newArr2<type>(sz1, sz2)
 #define newArr3(type, sz1, sz2, sz3) newArr3<type>(sz1, sz2, sz3)
 #define newArr4(type, sz1, sz2, sz3, sz4) newArr4<type>(sz1, sz2, sz3, sz4)
+
+// ------------------------------------------------------------
+// Pinned host-memory allocators (for faster H<->D transfers)
+// These create the same pointer-chain layout as newArr3(in,...)
+// but allocate the flat buffer with cudaMallocHost.
+// ------------------------------------------------------------
+
+static inline void cudaCheckAlloc(cudaError_t err, const char* what)
+{
+  if (err != cudaSuccess) {
+    std::fprintf(stderr, "CUDA error (%s): %s\n", what, cudaGetErrorString(err));
+    std::abort();
+  }
+}
+
+// 3D array with pinned flat storage + chained pointers
+template <class type>
+inline type ***newArr3Pinned(type **flat_out, size_t sz1, size_t sz2, size_t sz3)
+{
+  // allocate pinned contiguous block
+  type *flat = nullptr;
+  cudaCheckAlloc(cudaMallocHost((void**)&flat, sz1 * sz2 * sz3 * sizeof(type)), "cudaMallocHost newArr3Pinned");
+  *flat_out = flat;
+
+  // build pointer chain (same structure as newArr3(in, ...))
+  type ***arr = newArr2<type*>(sz1, sz2);
+  type **arr2 = *arr;
+  type *ptr = flat;
+  size_t szarr2 = sz1 * sz2;
+  for (size_t i = 0; i < szarr2; i++) {
+    arr2[i] = ptr;
+    ptr += sz3;
+  }
+  return arr;
+}
+
+// Free 3D array allocated with newArr3Pinned
+template <class type>
+inline void delArr3Pinned(type ***arr, type *flat)
+{
+  if (!arr) return;
+  // Free pointer chain (it was allocated with newArr2<type*> -> delArray2 works)
+  delArray2<type*>(arr);
+  // Free pinned flat buffer
+  if (flat) cudaCheckAlloc(cudaFreeHost(flat), "cudaFreeHost delArr3Pinned");
+}
 
 #endif
