@@ -671,15 +671,6 @@ int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters
 
 
     cudaCheck(cudaGetLastError(), "kernel launch mover_PC_kernel");
-    cudaCheck(cudaDeviceSynchronize(), "kernel sync mover_PC_kernel");
-
-    // Copy results back to host so CPU pipeline (interp/output) works unchanged 
-    cudaCheck(cudaMemcpy(part->x, dp.x, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy x D2H");
-    cudaCheck(cudaMemcpy(part->y, dp.y, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy y D2H");
-    cudaCheck(cudaMemcpy(part->z, dp.z, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy z D2H");
-    cudaCheck(cudaMemcpy(part->u, dp.u, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy u D2H");
-    cudaCheck(cudaMemcpy(part->v, dp.v, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy v D2H");
-    cudaCheck(cudaMemcpy(part->w, dp.w, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy w D2H");
 
     return 0;
 }
