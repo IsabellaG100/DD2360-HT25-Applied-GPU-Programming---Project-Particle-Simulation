@@ -1,11 +1,19 @@
+// Particles structure
 #include "Particles.h"
+// Helper functions
 #include "Alloc.h"
+// Precision: fix precision for different quantities
 #include "PrecisionTypes.h"
+// Defines functions for GPU  
 #include "ParticlesGPU.h"
+// CUDA header files
 #include <cuda.h>
 #include <cuda_runtime.h>
+// Standard Input/Output
 #include <cstdio>
+// Utilities 
 #include <cstdlib>
+// For math
 #include <cmath>
 
 //** CUDA error checking helper*/
@@ -67,11 +75,10 @@ struct MoverGPUContext {
     DeviceParticles* d_parts = nullptr;
 };
 
+// Gloabal instance
 static MoverGPUContext g_ctx;
 
-// ------------------------------------------------------------
-// GPU InterpP2G context (allocated once, reused each cycle)
-// ------------------------------------------------------------
+///** GPU InterpP2G context (allocated once, reused each cycle) */
 
 struct DeviceInterpDensSpecies {
     FPinterp* rhon = nullptr;
@@ -181,7 +188,7 @@ void particle_deallocate(struct particles* part)
     delete[] part->q;
 }
 
-/** particle mover */
+/** particle mover on CPU */
 int mover_PC(struct particles* part, struct EMfield* field, struct grid* grd, struct parameters* param)
 {
     // print species and subcycling
@@ -525,6 +532,7 @@ void mover_gpu_init(struct parameters* param, struct grid* grd, struct EMfield* 
 {
     if (g_ctx.initialized) return;
 
+    // Update struct with scalars from parameters and grid
     g_ctx.initialized = true;
     g_ctx.ns  = param->ns;
 
@@ -616,6 +624,7 @@ void mover_gpu_update_fields(struct grid* /*grd*/, struct EMfield* field)
 //** Move one species on GPU, then copy particles back to host */
 int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters* param)
 {
+    // Error checking
     if (!g_ctx.initialized) {
         std::fprintf(stderr, "mover_PC_GPU called before mover_gpu_init\n");
         return -1;
@@ -639,6 +648,7 @@ int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters
     const int periodicY = param->PERIODICY ? 1 : 0;
     const int periodicZ = param->PERIODICZ ? 1 : 0;
 
+    // Launch kernel
     mover_PC_kernel<<<blocks, threads>>>(
         dp.x, dp.y, dp.z,
         dp.u, dp.v, dp.w,
@@ -659,10 +669,11 @@ int mover_PC_GPU(struct particles* part, struct grid* /*grd*/, struct parameters
         g_ctx.nxn, g_ctx.nyn, g_ctx.nzn
     );
 
+
     cudaCheck(cudaGetLastError(), "kernel launch mover_PC_kernel");
     cudaCheck(cudaDeviceSynchronize(), "kernel sync mover_PC_kernel");
 
-    // Copy results back to host so CPU pipeline (interp/output) works unchanged
+    // Copy results back to host so CPU pipeline (interp/output) works unchanged 
     cudaCheck(cudaMemcpy(part->x, dp.x, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy x D2H");
     cudaCheck(cudaMemcpy(part->y, dp.y, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy y D2H");
     cudaCheck(cudaMemcpy(part->z, dp.z, nop * sizeof(FPpart), cudaMemcpyDeviceToHost), "Memcpy z D2H");
@@ -709,6 +720,10 @@ void mover_gpu_finalize()
 
     g_ctx = MoverGPUContext{};
 } // End of GPU mover
+
+// ------------------------------------------------------------
+// CPU Interpolation
+// ------------------------------------------------------------
 
 //** CPU Interpolation */
 /** Interpolation Particle --> Grid: This is for species */
@@ -867,11 +882,16 @@ void interpP2G(struct particles* part, struct interpDensSpecies* ids, struct gri
    
 }
 
-//** GPU interpolation */
+// ------------------------------------------------------------
+// GPU Interpolation
+// ------------------------------------------------------------
+
+//** safe wrapper for atomic add */
 __device__ __forceinline__ void atomicAddFPinterp(FPinterp* addr, FPinterp val) {
     atomicAdd(addr, val);
 }
 
+//** GPU interpolation */
 __global__ void interpP2G_kernel(
     // particles (device)
     const FPpart* x, const FPpart* y, const FPpart* z,
@@ -961,8 +981,10 @@ __global__ void interpP2G_kernel(
     }
 }
 
+/** initialization of GPU resources for the Interpolation P2G */
 void interp_gpu_init(struct parameters* param, struct grid* grd, struct interpDensSpecies* ids_host)
 {
+    // Error checking
     if (g_interp.initialized) return;
 
     if (!g_ctx.initialized) {
@@ -970,6 +992,7 @@ void interp_gpu_init(struct parameters* param, struct grid* grd, struct interpDe
         std::abort();
     }
 
+    // Assign scalar from param and grid
     g_interp.initialized = true;
     g_interp.ns = param->ns;
 
@@ -987,10 +1010,12 @@ void interp_gpu_init(struct parameters* param, struct grid* grd, struct interpDe
     g_interp.yStart = (FPpart)grd->yStart;
     g_interp.zStart = (FPpart)grd->zStart;
 
+    // look up for where species data is
     g_interp.d_ids = new DeviceInterpDensSpecies[g_interp.ns];
 
     size_t bytes = (size_t)g_interp.Nnodes * sizeof(FPinterp);
 
+    // iterate through species and allocate densities
     for (int is = 0; is < g_interp.ns; is++) {
         DeviceInterpDensSpecies& did = g_interp.d_ids[is];
 
@@ -1013,6 +1038,9 @@ void interp_gpu_init(struct parameters* param, struct grid* grd, struct interpDe
     // (We will zero every cycle anyway.)
 }
 
+/** Resets all density and pressure tensor buffers to zero on the GPU for a specific species 
+ *  Called before every new species
+*/
 void interp_gpu_zero_species(int is)
 {
     if (!g_interp.initialized) {
@@ -1020,6 +1048,7 @@ void interp_gpu_zero_species(int is)
         std::abort();
     }
 
+    // Resetting everyting to 0
     DeviceInterpDensSpecies& did = g_interp.d_ids[is];
     size_t bytes = (size_t)g_interp.Nnodes * sizeof(FPinterp);
 
@@ -1035,8 +1064,10 @@ void interp_gpu_zero_species(int is)
     cudaCheck(cudaMemset(did.pzz,  0, bytes), "memset pzz");
 }
 
+/** Launches the interpolation kernel and calls the resetting function */
 void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, struct grid* /*grd*/)
 {
+    // Error checking
     if (!g_interp.initialized) {
         std::fprintf(stderr, "interpP2G_GPU called before interp_gpu_init\n");
         std::abort();
@@ -1052,9 +1083,11 @@ void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, s
         std::abort();
     }
 
-    // Zero device densities for this species (must happen every cycle)
+    // Zero device densities for this species 
     interp_gpu_zero_species(is);
 
+
+    // Configuration for the kernel
     DeviceParticles& dp = g_ctx.d_parts[is];
     DeviceInterpDensSpecies& did = g_interp.d_ids[is];
 
@@ -1063,6 +1096,7 @@ void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, s
     int threads = 256;
     int blocks  = (int)((nop + threads - 1) / threads);
 
+    // Launching the kernel
     interpP2G_kernel<<<blocks, threads>>>(
         dp.x, dp.y, dp.z,
         dp.u, dp.v, dp.w,
@@ -1079,6 +1113,7 @@ void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, s
         did.pyy, did.pyz, did.pzz
     );
 
+    // Synchronization
     cudaCheck(cudaGetLastError(), "kernel launch interpP2G_kernel");
     cudaCheck(cudaDeviceSynchronize(), "kernel sync interpP2G_kernel");
 
@@ -1096,11 +1131,13 @@ void interpP2G_GPU(struct particles* part, struct interpDensSpecies* ids_host, s
     cudaCheck(cudaMemcpy(ids_host->pyz_flat,  did.pyz,  bytes, cudaMemcpyDeviceToHost), "Memcpy pyz D2H");
     cudaCheck(cudaMemcpy(ids_host->pzz_flat,  did.pzz,  bytes, cudaMemcpyDeviceToHost), "Memcpy pzz D2H");
 }
-
+/** Realease GPU resources used for the interpolation context */
 void interp_gpu_finalize()
 {
+    // Error checking
     if (!g_interp.initialized) return;
 
+    // realease memory
     if (g_interp.d_ids) {
         for (int is = 0; is < g_interp.ns; is++) {
             DeviceInterpDensSpecies& did = g_interp.d_ids[is];
