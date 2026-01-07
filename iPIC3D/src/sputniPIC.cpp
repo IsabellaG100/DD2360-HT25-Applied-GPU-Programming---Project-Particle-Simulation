@@ -75,10 +75,10 @@ int main(int argc, char **argv){
     // Initialization
     initGEM(&param,&grd,&field,&field_aux,part,ids);
 
-    // GPU mover setup (allocate device memory once)
+    // Mover on setup, allocate device memory
     mover_gpu_init(&param, &grd, &field, part);
     
-    // Allocate device memory for interpolation (once)
+    // Allocate device memory for interpolation
     interp_gpu_init(&param, &grd, ids);
 
     
@@ -93,7 +93,7 @@ int main(int argc, char **argv){
         std::cout << "***********************" << std::endl;
     
         // set to zero the densities - needed for interpolation
-        setZeroDensities(&idn,ids,&grd,param.ns);
+        setZeroDensities(&idn,ids,&grd,param.ns); 
         
         // Update E/B on the GPU once per cycle (host -> device).
         mover_gpu_update_fields(&grd, &field);
@@ -101,8 +101,11 @@ int main(int argc, char **argv){
         // implicit mover
         iMover = cpuSecond(); // start timer for mover
         for (int is=0; is < param.ns; is++)
+            // Mover on GPU
             mover_PC_GPU(&part[is], &grd, &param);
-            //mover_PC(&part[is],&field,&grd,&param);
+            // Mover on CPU
+            /** Remove comment below if you want to run on CPU */
+            //mover_PC(&part[is],&field,&grd,&param); 
         eMover += (cpuSecond() - iMover); // stop timer for mover
         
         
@@ -112,12 +115,14 @@ int main(int argc, char **argv){
         iInterp = cpuSecond(); // start timer for the interpolation step
         // interpolate species
         for (int is=0; is < param.ns; is++)
+            // Interpolation on GPU
             interpP2G_GPU(&part[is], &ids[is], &grd);
+            /** Remove comment below if you want to run on CPU */
             //interpP2G(&part[is],&ids[is],&grd);
         // apply BC to interpolated densities
         for (int is=0; is < param.ns; is++)
             applyBCids(&ids[is],&grd,&param);
-        // sum over species
+        // sum densities over species
         sumOverSpecies(&idn,ids,&grd,param.ns);
         // interpolate charge density from center to node
         applyBCscalarDensN(idn.rhon,&grd,&param);
@@ -134,7 +139,7 @@ int main(int argc, char **argv){
         
         
     
-    }  // end of one PIC cycle
+    }  // end of one cycle
     
     // Release device resources
     mover_gpu_finalize();
@@ -144,7 +149,7 @@ int main(int argc, char **argv){
     // deallocate field
     grid_deallocate(&grd);
     field_deallocate(&grd,&field);
-    // interp
+    // deallocate interp
     interp_dens_net_deallocate(&grd,&idn);
     
     // Deallocate interpolated densities and particles
